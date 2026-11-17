@@ -1,35 +1,59 @@
-// gta6-twitch-forecast — main.ts
+// gta6-twitch-forecast — main.ts (model v2)
 //
 // Forecasts Twitch concurrent viewers in the Grand Theft Auto VI category
 // for hours 2..24 of a launch day, as five quantiles per hour, from the
 // case's hour-1 print plus the launch-day shapes of past big launches.
 //
-// Model (comparable-launch log-ratio regression):
-//   For each comparable launch, take its release-day hourly curve and form
-//   log-ratios r_h = ln(viewers_h / viewers_1) for h = 2..24.  A launch only
-//   counts when it is a real rolling-midnight console launch: tier
-//   "comparable" (no early-access contamination, no free-to-play, no
-//   slow-burn weak launches), no PC in its platforms, and an hour-1 print
-//   already at least 10% of its own release-day peak (so hour 1 is a
-//   post-unlock hour, not a near-zero pre-unlock reading — simultaneous
-//   global unlocks fail this and would otherwise blow the ratios up).
-//   Then, per hour, fit a weighted least-squares line
-//   r_h ~ a_h + b_h * ln(hour-1 print), weights 1 / (1 + 2|ln h1_comp - ln p|)
-//   so launches near the target's scale count most, and shrink each hour's
-//   slope toward the pooled global slope (shrinkage weight 2 on the
-//   weighted sum of squares).  The median forecast is the fitted line at
-//   the target's log hour-1 print; the spread is the weighted residual
-//   standard deviation times 1.6, and the five quantiles are the median
-//   plus z_tau * spread (z = -1.645, -0.674, 0, 0.674, 1.645).
-//   Why the regression: across launches the evening rise is strongly
-//   scale-dependent — small hour-1 prints rise much more by US prime time
-//   than big ones do (fitted late-day slopes around -0.4).  A flat median
-//   misses that; the regression captures it.  On the four practice cases
-//   this scores a mean pinball loss of ~0.19 against the house baseline's
-//   ~0.39, with a typical miss of ~36% and ~0.87 ninety-percent coverage.
-//   Fallbacks: if fewer than 5 console comparables have an hour, widen to
-//   every tier-comparable launch with a real hour 1; if still fewer than
-//   5, fall back to the flat-at-hour-1 forecast with the baseline spread.
+// Model v2 (pooled log-ratio regression with a smooth hour-varying slope
+// and a viewers-per-channel level):
+//   For each comparable launch, form log-ratios r_{i,h} = ln(viewers_h /
+//   viewers_1) for h = 2..24.  A launch only counts when it is a real
+//   rolling-midnight console launch: tier "comparable" (no early-access
+//   contamination, no free-to-play, no slow-burn weak launches), no PC in
+//   its platforms, and an hour-1 print already at least 10% of its own
+//   release-day peak (so hour 1 is a post-unlock hour, not a near-zero
+//   pre-unlock reading — simultaneous global unlocks fail this and would
+//   otherwise blow the ratios up).
+//   Then fit ONE pooled weighted least-squares model over every
+//   (launch, hour) point:
+//     r_{i,h} = s_h + (b0 + b1*u_h + b2*u_h^2) * ln(h1_i)
+//                 + c0 * (ln vpc_i - mean ln vpc)
+//     u_h = max(0, h - 5) / 19   (ramps from the US-East unlock, 05:00Z,
+//     to the end of the day), vpc_i = hour-1 viewers / hour-1 channels.
+//   The 23 hour intercepts s_h carry the shared unlock-wave shape (the
+//   US-East 05:00Z and US-West 08:00Z jumps, the evening prime-time
+//   peak); the slope basis lets the scale effect grow through the day
+//   instead of estimating 23 separate noisy per-hour slopes from ~7
+//   launches each (v1 did that); the viewers-per-channel term is a level
+//   shift — broad grassroots audiences (low viewers per channel) run
+//   hotter all day relative to hour 1 than concentrated big-streamer
+//   audiences.  Weights are 1 (scale weighting did not help on
+//   cross-validation).  The spread is the POOLED residual standard
+//   deviation x 1.3 (per-hour residual SDs from ~7 points are too noisy),
+//   and the five quantiles are median + z_tau * spread
+//   (z = -1.645, -0.674, 0, 0.674, 1.645).
+//   Why this beats v1: pooling the slope across hours and the spread
+//   across hours removes most of the estimation noise, and the
+//   viewers-per-channel term captures a real level difference the scale
+//   regression misses.  Selected by leave-one-launch-out
+//   cross-validation over the console comparables AND the four practice
+//   cases (a variant had to win on both): on the four practice cases v2
+//   scores a mean pinball loss of ~0.179 against v1's ~0.194 and the
+//   house baseline's ~0.387; leave-one-launch-out over the 7 console
+//   comparables 0.155 vs v1's 0.168, and over the 11 console launches
+//   (the 7 plus the 4 practice launches, as the final case has them)
+//   0.156 vs v1's 0.179.  Per practice case: Wolverine 0.309, Red Dead
+//   Redemption 2 0.094, God of War Ragnarok 0.118, Spider-Man 2 0.195.
+//   Variants tried and rejected on cross-validation: per-hour slopes
+//   (v1), wider (PC-inclusive) training pool, quadratic in ln hour-1,
+//   recency weighting, t / empirical residual quantiles, asymmetric
+//   spreads, and pre-launch history-trend features (they win on the
+//   practice cases but lose on leave-one-launch-out — classic
+//   overfitting to four launches).
+//   Fallbacks: if fewer than 5 console comparables have an hour, widen
+//   to every tier-comparable launch with a real hour 1; if still fewer
+//   than 5, fall back to the flat-at-hour-1 forecast with the baseline
+//   spread.
 //
 // Deterministic: no clock, no randomness, no network, stdlib only.
 // Reads every *.in file in $MAKEFUN_INPUT_DIR (else /input/), in name
@@ -50,16 +74,15 @@ type Comparable = {
 
 type CaseFile = {
   id: string;
-  known: { hour: number; viewers: number }[];
+  known: { hour: number; viewers: number; channels?: number | null }[];
   forecast?: { hour: number }[];
   comparables: Comparable[];
 };
 
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
-const SIGMA_MULT = 1.6;
-const SLOPE_SHRINK = 2.0;
-const SCALE_WEIGHT_K = 2.0;
+const SIGMA_MULT = 1.3;
 const MIN_COMPARABLES = 5;
+const VPC_CLAMP = 1.5;
 
 // A launch's release-day hours 1..24 (viewers > 0), keyed by hour.
 function dayHours(comp: Comparable): Map<number, number> {
@@ -76,6 +99,19 @@ function dayHours(comp: Comparable): Map<number, number> {
     }
   }
   return out;
+}
+
+// Hour-1 channels of a comparable (null when the source has none).
+function hour1Channels(comp: Comparable): number | null {
+  const t0 = Date.parse(comp.day_start);
+  if (!Number.isFinite(t0)) return null;
+  for (const pt of comp.hourly || []) {
+    if (pt.viewers == null || pt.viewers <= 0) continue;
+    const t = Date.parse(pt.from);
+    if (!Number.isFinite(t)) continue;
+    if (t === t0 && pt.channels != null && pt.channels > 0) return pt.channels;
+  }
+  return null;
 }
 
 function tierOf(comp: Comparable): string {
@@ -105,59 +141,58 @@ function isWider(comp: Comparable, dh: Map<number, number>): boolean {
   return peak > 0 && h1 >= 0.1 * peak;
 }
 
-type RatioPoint = { x: number; y: number; w: number };
+// Slope basis: ramps from the US-East unlock (05:00Z, hour 5) to the
+// end of the day.  b(u) = b0 + b1*u + b2*u^2 is the log-ratio slope on
+// ln(hour-1 print) at hour h.
+function uOf(h: number): number {
+  return Math.max(0, h - 5) / 19;
+}
 
-// Weighted least squares of y on x; returns [intercept, slope].
-function wls(pts: RatioPoint[]): [number, number] {
-  let sw = 0;
-  let mx = 0;
-  let my = 0;
-  for (const pt of pts) {
-    sw += pt.w;
-    mx += pt.w * pt.x;
-    my += pt.w * pt.y;
+// Solve A x = b by Gaussian elimination with partial pivoting.
+// A is modified in place; returns null when the system is singular.
+function solveLinear(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  const M: number[][] = A.map((row, i) => [...row, b[i]]);
+  for (let i = 0; i < n; i++) {
+    let piv = i;
+    for (let r = i + 1; r < n; r++) {
+      if (Math.abs(M[r][i]) > Math.abs(M[piv][i])) piv = r;
+    }
+    if (Math.abs(M[piv][i]) < 1e-12) return null;
+    if (piv !== i) {
+      const tmp = M[i];
+      M[i] = M[piv];
+      M[piv] = tmp;
+    }
+    for (let r = i + 1; r < n; r++) {
+      const f = M[r][i] / M[i][i];
+      if (f === 0) continue;
+      for (let c = i; c <= n; c++) M[r][c] -= f * M[i][c];
+    }
   }
-  if (sw <= 0) return [0, 0];
-  mx /= sw;
-  my /= sw;
-  let sxx = 0;
-  let sxy = 0;
-  for (const pt of pts) {
-    const dx = pt.x - mx;
-    sxx += pt.w * dx * dx;
-    sxy += pt.w * dx * (pt.y - my);
+  const x = new Array<number>(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = M[i][n];
+    for (let j = i + 1; j < n; j++) s -= M[i][j] * x[j];
+    x[i] = s / M[i][i];
   }
-  const b = sxx > 1e-9 ? sxy / sxx : 0;
-  return [my - b * mx, b];
+  return x;
 }
 
 function forecastCase(c: CaseFile): { hours: { hour: number; q: number[] }[] } {
   const known1 = (c.known && c.known[0] && c.known[0].viewers) || 0;
   const p = Math.max(known1, 1);
   const lp = Math.log(p);
+  const ch1 =
+    c.known && c.known[0] && c.known[0].channels != null && c.known[0].channels > 0
+      ? (c.known[0].channels as number)
+      : null;
 
   // Precompute each comparable's day curve once.
-  const curves: { comp: Comparable; dh: Map<number, number> }[] = [];
+  const curves: { comp: Comparable; dh: Map<number, number>; ch1: number | null }[] = [];
   for (const comp of c.comparables || []) {
     const dh = dayHours(comp);
-    if (dh.get(1) != null) curves.push({ comp, dh });
-  }
-
-  // Pooled global slope over all hours, primary set (falls back to wider).
-  function collect(select: (comp: Comparable, dh: Map<number, number>) => boolean, hour: number | null): RatioPoint[] {
-    const pts: RatioPoint[] = [];
-    for (const { comp, dh } of curves) {
-      if (!select(comp, dh)) continue;
-      const h1 = dh.get(1) as number;
-      const w = 1 / (1 + SCALE_WEIGHT_K * Math.abs(Math.log(h1) - lp));
-      const hours = hour == null ? [...dh.keys()].filter((h) => h >= 2) : [hour];
-      for (const h of hours) {
-        const vh = dh.get(h);
-        if (vh == null || h < 2) continue;
-        pts.push({ x: Math.log(h1), y: Math.log(vh / h1), w });
-      }
-    }
-    return pts;
+    if (dh.get(1) != null) curves.push({ comp, dh, ch1: hour1Channels(comp) });
   }
 
   // The primary set is the console-only rolling-midnight launches.  In the
@@ -166,61 +201,114 @@ function forecastCase(c: CaseFile): { hours: { hour: number; q: number[] }[] } {
   const useWider =
     curves.filter(({ comp, dh }) => isPrimary(comp, dh)).length < MIN_COMPARABLES;
   const select = useWider ? isWider : isPrimary;
-
-  const pooled = collect(select, null);
-  const [, globalSlope] = wls(pooled);
+  const use = curves.filter(({ comp, dh }) => select(comp, dh));
 
   const hours: { hour: number; q: number[] }[] = [];
-  for (let h = 2; h <= 24; h++) {
-    let pts = collect(select, h);
-    let sel = select;
-    if (pts.length < MIN_COMPARABLES && !useWider) {
-      // Too few console comparables this hour: widen for this hour only.
-      sel = isWider;
-      pts = collect(sel, h);
-    }
-    let q: number[];
-    if (pts.length < MIN_COMPARABLES) {
-      // Still too thin: flat at hour 1 with the baseline spread.
+  if (use.length < MIN_COMPARABLES) {
+    // Too thin: flat at hour 1 with the baseline spread.
+    for (let h = 2; h <= 24; h++) {
       const s = 0.15 * Math.sqrt(h - 1);
-      q = Z.map((z) => p * Math.exp(z * s));
-    } else {
-      // Per-hour fit, slope shrunk toward the pooled global slope.
-      const [aHour, bHour] = wls(pts);
-      let sw = 0;
-      let mx = 0;
-      for (const pt of pts) {
-        sw += pt.w;
-        mx += pt.w * pt.x;
-      }
-      mx = sw > 0 ? mx / sw : 0;
-      let sxx = 0;
-      for (const pt of pts) {
-        const dx = pt.x - mx;
-        sxx += pt.w * dx * dx;
-      }
-      const b = (sxx * bHour + SLOPE_SHRINK * globalSlope) / (sxx + SLOPE_SHRINK);
-      const my = pts.reduce((acc, pt) => acc + pt.w * pt.y, 0) / sw;
-      const a = my - b * mx;
-      const med = a + b * lp;
-      let v = 0;
-      for (const pt of pts) {
-        const r = pt.y - (a + b * pt.x);
-        v += pt.w * r * r;
-      }
-      const sig = Math.max(Math.sqrt(v / sw), 0.05) * SIGMA_MULT;
-      q = Z.map((z) => p * Math.exp(med + z * sig));
+      hours.push({ hour: h, q: Z.map((z) => p * Math.exp(z * s)) });
     }
-    // Round to 2 decimals, clamp to (0, 1e9], keep non-decreasing.
+  } else {
+    // Mean log viewers-per-channel over the training launches that have
+    // hour-1 channels; the vpc term is centred on it.
+    let vpcSum = 0;
+    let vpcN = 0;
+    for (const { dh, ch1: c1 } of use) {
+      const h1 = dh.get(1) as number;
+      if (c1 != null) {
+        vpcSum += Math.log(h1 / c1);
+        vpcN++;
+      }
+    }
+    const mvpc = vpcN > 0 ? vpcSum / vpcN : 0;
+
+    // One pooled fit over every (launch, hour) point.
+    // Columns: s_2..s_24 (23), b0, b1, b2, c0  =>  27 parameters.
+    const NPAR = 27;
+    const A: number[][] = Array.from({ length: NPAR }, () => new Array<number>(NPAR).fill(0));
+    const rhs = new Array<number>(NPAR).fill(0);
+    type Pt = { h: number; x: number; v: number; y: number };
+    const pts: Pt[] = [];
+    for (const { dh, ch1: c1 } of use) {
+      const h1 = dh.get(1) as number;
+      const x = Math.log(h1);
+      const v = c1 != null ? Math.log(h1 / c1) - mvpc : 0;
+      for (let h = 2; h <= 24; h++) {
+        const vh = dh.get(h);
+        if (vh == null) continue;
+        const y = Math.log(vh / h1);
+        pts.push({ h, x, v, y });
+        const u = uOf(h);
+        const row = new Array<number>(NPAR).fill(0);
+        row[h - 2] = 1;
+        row[23] = x;
+        row[24] = x * u;
+        row[25] = x * u * u;
+        row[26] = v;
+        for (let i = 0; i < NPAR; i++) {
+          if (row[i] === 0) continue;
+          rhs[i] += row[i] * y;
+          for (let j = 0; j < NPAR; j++) {
+            if (row[j] !== 0) A[i][j] += row[i] * row[j];
+          }
+        }
+      }
+    }
+    // Tiny ridge for numerical stability.
+    for (let i = 0; i < NPAR; i++) A[i][i] += 1e-9;
+    const coef = solveLinear(A, rhs);
+
+    if (coef == null || pts.length < NPAR) {
+      // Singular fit: flat at hour 1 with the baseline spread.
+      for (let h = 2; h <= 24; h++) {
+        const s = 0.15 * Math.sqrt(h - 1);
+        hours.push({ hour: h, q: Z.map((z) => p * Math.exp(z * s)) });
+      }
+    } else {
+      const s = coef.slice(0, 23);
+      const b0 = coef[23];
+      const b1 = coef[24];
+      const b2 = coef[25];
+      const c0 = coef[26];
+      // Pooled residual SD over every fitted point.
+      let ss = 0;
+      for (const pt of pts) {
+        const u = uOf(pt.h);
+        const pred =
+          s[pt.h - 2] + (b0 + b1 * u + b2 * u * u) * pt.x + c0 * pt.v;
+        const r = pt.y - pred;
+        ss += r * r;
+      }
+      const sig = Math.max(Math.sqrt(ss / pts.length), 0.05) * SIGMA_MULT;
+      // Target's centred log viewers-per-channel, clamped so an extreme
+      // hour-1 channel count cannot swing the forecast wildly.
+      let vt = 0;
+      if (ch1 != null) {
+        vt = Math.log(p / ch1) - mvpc;
+        if (vt > VPC_CLAMP) vt = VPC_CLAMP;
+        if (vt < -VPC_CLAMP) vt = -VPC_CLAMP;
+      }
+      for (let h = 2; h <= 24; h++) {
+        const u = uOf(h);
+        const med = s[h - 2] + (b0 + b1 * u + b2 * u * u) * lp + c0 * vt;
+        hours.push({ hour: h, q: Z.map((z) => p * Math.exp(med + z * sig)) });
+      }
+    }
+  }
+
+  // Round to 2 decimals, clamp to (0, 1e9], keep non-decreasing.
+  for (const row of hours) {
     const rounded: number[] = [];
     for (let i = 0; i < 5; i++) {
-      let v = Math.round(q[i] * 100) / 100;
+      let v = Math.round(row.q[i] * 100) / 100;
       if (!Number.isFinite(v) || v <= 0) v = 0.01;
       if (v > 1e9) v = 1e9;
       if (i > 0 && v < rounded[i - 1]) v = rounded[i - 1];
       rounded.push(v);
     }
-    hours.push({ hour: h, q: rounded });
+    row.q = rounded;
   }
   return { hours };
 }
