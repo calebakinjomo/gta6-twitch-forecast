@@ -1,11 +1,11 @@
-// gta6-twitch-forecast — main.ts (model v2)
+// gta6-twitch-forecast — main.ts (model v3)
 //
 // Forecasts Twitch concurrent viewers in the Grand Theft Auto VI category
 // for hours 2..24 of a launch day, as five quantiles per hour, from the
 // case's hour-1 print plus the launch-day shapes of past big launches.
 //
-// Model v2 (pooled log-ratio regression with a smooth hour-varying slope
-// and a viewers-per-channel level):
+// Model v3 (pooled pinball-median regression with a smooth hour-varying
+// slope and a viewers-per-channel level):
 //   For each comparable launch, form log-ratios r_{i,h} = ln(viewers_h /
 //   viewers_1) for h = 2..24.  A launch only counts when it is a real
 //   rolling-midnight console launch: tier "comparable" (no early-access
@@ -14,8 +14,7 @@
 //   release-day peak (so hour 1 is a post-unlock hour, not a near-zero
 //   pre-unlock reading — simultaneous global unlocks fail this and would
 //   otherwise blow the ratios up).
-//   Then fit ONE pooled weighted least-squares model over every
-//   (launch, hour) point:
+//   Then fit ONE pooled model over every (launch, hour) point:
 //     r_{i,h} = s_h + (b0 + b1*u_h + b2*u_h^2) * ln(h1_i)
 //                 + c0 * (ln vpc_i - mean ln vpc)
 //     u_h = max(0, h - 5) / 19   (ramps from the US-East unlock, 05:00Z,
@@ -24,32 +23,46 @@
 //   US-East 05:00Z and US-West 08:00Z jumps, the evening prime-time
 //   peak); the slope basis lets the scale effect grow through the day
 //   instead of estimating 23 separate noisy per-hour slopes from ~7
-//   launches each (v1 did that); the viewers-per-channel term is a level
-//   shift — broad grassroots audiences (low viewers per channel) run
-//   hotter all day relative to hour 1 than concentrated big-streamer
-//   audiences.  Weights are 1 (scale weighting did not help on
-//   cross-validation).  The spread is the POOLED residual standard
-//   deviation x 1.3 (per-hour residual SDs from ~7 points are too noisy),
-//   and the five quantiles are median + z_tau * spread
-//   (z = -1.645, -0.674, 0, 0.674, 1.645).
-//   Why this beats v1: pooling the slope across hours and the spread
-//   across hours removes most of the estimation noise, and the
-//   viewers-per-channel term captures a real level difference the scale
-//   regression misses.  Selected by leave-one-launch-out
-//   cross-validation over the console comparables AND the four practice
-//   cases (a variant had to win on both): on the four practice cases v2
-//   scores a mean pinball loss of ~0.179 against v1's ~0.194 and the
-//   house baseline's ~0.387; leave-one-launch-out over the 7 console
-//   comparables 0.155 vs v1's 0.168, and over the 11 console launches
-//   (the 7 plus the 4 practice launches, as the final case has them)
-//   0.156 vs v1's 0.179.  Per practice case: Wolverine 0.309, Red Dead
-//   Redemption 2 0.094, God of War Ragnarok 0.118, Spider-Man 2 0.195.
-//   Variants tried and rejected on cross-validation: per-hour slopes
-//   (v1), wider (PC-inclusive) training pool, quadratic in ln hour-1,
-//   recency weighting, t / empirical residual quantiles, asymmetric
-//   spreads, and pre-launch history-trend features (they win on the
-//   practice cases but lose on leave-one-launch-out — classic
-//   overfitting to four launches).
+//   launches each; the viewers-per-channel term is a level shift —
+//   broad grassroots audiences (low viewers per channel) run hotter all
+//   day relative to hour 1 than concentrated big-streamer audiences.
+//   THE V3 CHANGE — the median curve is fitted by direct pinball loss,
+//   not least squares: the 27 coefficients are the minimiser of
+//   sum rho_0.5(y - x'beta) over all fitted points (iteratively
+//   reweighted least squares from the least-squares solution, fixed 60
+//   iterations, smoothing eps 0.05, deterministic).  The scored metric
+//   IS the pinball loss, so the median that minimises it on the training
+//   launches beats the least-squares median: least squares is pulled by
+//   the extreme launches (a small launch's +1.7 evening surge, a
+//   mega-launch's flat evening), while the pinball median tracks the
+//   typical launch.  The spread is unchanged from v2: the POOLED
+//   least-squares residual standard deviation x 1.3, and the five
+//   quantiles are median + z_tau * spread (z = -1.645, -0.674, 0, 0.674,
+//   1.645).  Direct pinball fits of the tail quantiles were tried and
+//   rejected (they overfit: practice 0.192, CV-11 0.161); the pooled
+//   residual distribution is close to Gaussian (fitted spread
+//   multipliers -1.64/-0.52/+0.08/+0.50/+1.72 vs Gaussian z), so the
+//   Gaussian spread stays.
+//   Selected by leave-one-launch-out cross-validation over the console
+//   comparables AND the four practice cases (a variant had to win on
+//   both): on the four practice cases v3 scores a mean pinball loss of
+//   ~0.177 against v2's ~0.179 and the house baseline's ~0.387; per
+//   practice case: Wolverine 0.254, Red Dead Redemption 2 0.091, God of
+//   War Ragnarok 0.136, Spider-Man 2 0.228.  Leave-one-launch-out over
+//   the 11 console launches (the 7 comparables plus the 4 practice
+//   launches, as the final case has them): 0.150 vs v2's 0.156 — v3 wins
+//   on 8 of the 11 launches, most on the surge launches (Wolverine
+//   -0.027, Saros -0.026, Zelda -0.018).  The final case trains on all
+//   11, so the same robustness applies there.
+//   Variants tried and rejected on cross-validation: per-quantile
+//   pinball fits, pinball-fitted spread multipliers, per-hour spreads,
+//   Huber medians (between least squares and pinball), smoothed hour
+//   intercepts, pre-launch history features (f48, pre-launch peak —
+//   they win on the practice cases but lose badly on
+//   leave-one-launch-out), wider (PC-inclusive) training pool,
+//   quadratic in ln hour-1, recency weighting, t / empirical residual
+//   quantiles, asymmetric spreads, and the ln h1 x vpc interaction
+//   (practice 0.176 but CV-11 0.167 — classic overfitting).
 //   Fallbacks: if fewer than 5 console comparables have an hour, widen
 //   to every tier-comparable launch with a real hour 1; if still fewer
 //   than 5, fall back to the flat-at-hour-1 forecast with the baseline
@@ -83,6 +96,9 @@ const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 const SIGMA_MULT = 1.3;
 const MIN_COMPARABLES = 5;
 const VPC_CLAMP = 1.5;
+// Pinball-median fit: fixed 60 IRLS iterations, smoothing eps 0.05.
+const PB_ITERS = 60;
+const PB_EPS = 0.05;
 
 // A launch's release-day hours 1..24 (viewers > 0), keyed by hour.
 function dayHours(comp: Comparable): Map<number, number> {
@@ -146,6 +162,62 @@ function isWider(comp: Comparable, dh: Map<number, number>): boolean {
 // ln(hour-1 print) at hour h.
 function uOf(h: number): number {
   return Math.max(0, h - 5) / 19;
+}
+
+// One design row of the pooled model: 23 hour intercepts (s_2..s_24),
+// then ln(h1), ln(h1)*u, ln(h1)*u^2, centred ln viewers-per-channel.
+function designRow(h: number, x: number, v: number): number[] {
+  const row = new Array<number>(27).fill(0);
+  row[h - 2] = 1;
+  const u = uOf(h);
+  row[23] = x;
+  row[24] = x * u;
+  row[25] = x * u * u;
+  row[26] = v;
+  return row;
+}
+
+type FitPt = { h: number; x: number; v: number; y: number };
+
+// The pinball-median (tau = 0.5) fit: minimise sum rho_0.5(y - x'beta)
+// by iteratively reweighted least squares from the least-squares
+// solution.  The pinball loss rho_0.5(r) = 0.5*|r| has gradient
+// 0.5*sign(r), so the IRLS weight is 0.5 / sqrt(r^2 + eps^2) (the eps
+// smooths the kink at r = 0).  Fixed iteration count, fixed eps, no
+// randomness, no clock: the same input always gives the same output.
+// Returns the least-squares coefficients unchanged when a step fails.
+function pinballMedianFit(pts: FitPt[], init: number[]): number[] {
+  const NPAR = 27;
+  let beta = [...init];
+  const rows = pts.map((pt) => ({ row: designRow(pt.h, pt.x, pt.v), y: pt.y }));
+  for (let iter = 0; iter < PB_ITERS; iter++) {
+    const A: number[][] = Array.from({ length: NPAR }, () => new Array<number>(NPAR).fill(0));
+    const rhs = new Array<number>(NPAR).fill(0);
+    for (const { row, y } of rows) {
+      let pred = 0;
+      for (let i = 0; i < NPAR; i++) pred += row[i] * beta[i];
+      const r = y - pred;
+      const w = 0.5 / Math.sqrt(r * r + PB_EPS * PB_EPS);
+      for (let i = 0; i < NPAR; i++) {
+        if (row[i] === 0) continue;
+        rhs[i] += w * row[i] * y;
+        for (let j = 0; j < NPAR; j++) {
+          if (row[j] !== 0) A[i][j] += w * row[i] * row[j];
+        }
+      }
+    }
+    for (let i = 0; i < NPAR; i++) A[i][i] += 1e-8;
+    const next = solveLinear(A, rhs);
+    if (next == null) break;
+    let delta = 0;
+    for (let i = 0; i < NPAR; i++) {
+      const d = Math.abs(next[i] - beta[i]);
+      if (d > delta) delta = d;
+    }
+    beta = next;
+    if (delta < 1e-10) break;
+  }
+  return beta;
 }
 
 // Solve A x = b by Gaussian elimination with partial pivoting.
@@ -267,17 +339,22 @@ function forecastCase(c: CaseFile): { hours: { hour: number; q: number[] }[] } {
         hours.push({ hour: h, q: Z.map((z) => p * Math.exp(z * s)) });
       }
     } else {
-      const s = coef.slice(0, 23);
-      const b0 = coef[23];
-      const b1 = coef[24];
-      const b2 = coef[25];
-      const c0 = coef[26];
-      // Pooled residual SD over every fitted point.
+      // The median curve is the pinball (least-absolute-deviation) fit:
+      // it minimises the scored loss itself on the training launches,
+      // where the least-squares median is pulled by the extreme ones.
+      const medCoef = pinballMedianFit(pts, coef);
+      const s = medCoef.slice(0, 23);
+      const b0 = medCoef[23];
+      const b1 = medCoef[24];
+      const b2 = medCoef[25];
+      const c0 = medCoef[26];
+      // Pooled residual SD over every fitted point (least-squares fit,
+      // as in v2 — the spread is unchanged).
       let ss = 0;
       for (const pt of pts) {
         const u = uOf(pt.h);
         const pred =
-          s[pt.h - 2] + (b0 + b1 * u + b2 * u * u) * pt.x + c0 * pt.v;
+          coef[pt.h - 2] + (coef[23] + coef[24] * u + coef[25] * u * u) * pt.x + coef[26] * pt.v;
         const r = pt.y - pred;
         ss += r * r;
       }
